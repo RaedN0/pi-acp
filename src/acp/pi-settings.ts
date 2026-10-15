@@ -58,6 +58,30 @@ export function getEnableSkillCommands(cwd: string): boolean {
 }
 
 /**
+ * Whether extension-registered slash commands should be advertised via ACP.
+ *
+ * pi settings: `acp.includeExtensionCommands` (false disables).
+ * Env override: `PI_ACP_INCLUDE_EXTENSION_COMMANDS=0|false` disables, `1|true` enables.
+ * The pi setting wins: env is only consulted when the setting is absent.
+ */
+export function getIncludeExtensionCommands(cwd: string): boolean {
+  const merged = getMergedSettings(cwd)
+
+  const acp = isObject(merged.acp) ? merged.acp : undefined
+  const direct = acp?.includeExtensionCommands
+  if (typeof direct === 'boolean') return direct
+
+  const env = process.env.PI_ACP_INCLUDE_EXTENSION_COMMANDS
+  if (typeof env === 'string') {
+    const value = env.trim().toLowerCase()
+    if (value === '0' || value === 'false') return false
+    if (value === '1' || value === 'true') return true
+  }
+
+  return true
+}
+
+/**
  * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
  * We use it to decide whether to synthesize + emit our own "startup info" message.
  */

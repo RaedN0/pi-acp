@@ -15,6 +15,7 @@ import {
   PiRpcProcess,
   PiRpcSpawnError,
   SESSION_STATS_TIMEOUT_MS,
+  type PiPromptResult,
   type PiRpcEvent,
   type PiSessionStats
 } from '../pi-rpc/process.js'
@@ -66,6 +67,15 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+/**
+ * How long a `handled` prompt (extension command / input handler consumed it, so no
+ * agent run is started) must stay quiet before the ACP turn is resolved. Any pi event
+ * resets the timer; blocking dialogs pause settlement entirely.
+ */
+export const HANDLED_PROMPT_IDLE_MS = 1_000
+
+const BLOCKING_EXTENSION_UI_METHODS = new Set(['select', 'confirm', 'input', 'editor'])
 
 /**
  * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null whenever pi
@@ -312,6 +322,15 @@ export class PiAcpSession {
   // completes only when `agent_settled` is emitted.
   private inAgentLoop = false
 
+  // A `handled` prompt (extension command / input handler) starts no agent run, so no
+  // `agent_settled` will arrive. Instead we settle once pi goes quiet. Track the watcher
+  // plus the conditions that keep the turn open.
+  private handledTurnActive = false
+  private handledIdleTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly pendingBlockingUiRequestIds = new Set<string>()
+  // Extension command names (from `get_commands`), used to classify legacy pi prompts.
+  private knownExtensionCommands = new Set<string>()
+
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
   // events may need to be implemented in pi in the future.
@@ -342,11 +361,21 @@ export class PiAcpSession {
     this.initialTitlePending = opts.autoTitle ?? false
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
+    // Older/stubbed pi processes may not expose an exit hook.
+    this.proc.onExit?.(() => this.handlePiExit())
   }
 
   setStartupInfo(text: string) {
     this.startupInfo = text
     this.startupInfoSent = false
+  }
+
+  /**
+   * Cache extension command names so legacy pi (< 1.x, no `prompt` disposition) can be
+   * classified without an extra RPC round-trip.
+   */
+  setKnownExtensionCommands(names: string[]): void {
+    this.knownExtensionCommands = new Set(names)
   }
 
   /**
@@ -418,6 +447,13 @@ export class PiAcpSession {
         sessionUpdate: 'session_info_update',
         _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
       })
+    }
+
+    // A handled prompt has no agent run to abort; settle it directly so the client
+    // sees `cancelled` instead of waiting for an `agent_settled` that never comes.
+    if (this.handledTurnActive) {
+      this.cancelHandledTurnWatcher()
+      void this.settleTurn()
     }
 
     // Abort the currently running turn (if any). If nothing is running, this is a no-op.
@@ -513,6 +549,8 @@ export class PiAcpSession {
   }
 
   private async settleTurn(): Promise<void> {
+    this.cancelHandledTurnWatcher()
+
     // Ensure all updates derived from pi events (plus the final usage update) are
     // delivered before we resolve the ACP `session/prompt` request.
     await this.publishContextUsage()
@@ -608,35 +646,121 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
+    this.proc
+      .prompt(t.message, t.images)
+      .then(result => this.onPromptAccepted(t, result))
+      .catch(err => {
+        // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
+        // Also ensure we flush any already-enqueued updates first.
+        void this.flushEmits().finally(() => {
+          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+          const authErr = maybeAuthRequiredError(err)
+          if (authErr) {
+            this.pendingTurn?.reject(authErr)
+          } else {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+            this.pendingTurn?.resolve(reason)
+          }
 
-        this.pendingTurn = null
-        this.inAgentLoop = false
+          this.pendingTurn = null
+          this.inAgentLoop = false
 
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
+          // But we still clear the queueDepth metadata.
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          })
         })
+        void err
       })
-      void err
+  }
+
+  /**
+   * The `prompt` RPC is only an acknowledgement. For pi >= 1.x it reports how the
+   * submission was handled; `handled` means no agent run started and no `agent_settled`
+   * will ever arrive, so we watch for quiescence instead.
+   */
+  private onPromptAccepted(t: QueuedTurn, result: PiPromptResult | undefined): void {
+    // The turn may already have settled (e.g. a fast run that ended before the response).
+    if (!this.pendingTurn) return
+    if (this.handledTurnActive || this.inAgentLoop) return
+
+    if (this.classifyPromptOutcome(t.message, result) !== 'handled') return
+
+    this.armHandledTurnWatcher()
+  }
+
+  private classifyPromptOutcome(message: string, result: PiPromptResult | undefined): 'handled' | 'normal' {
+    const disposition = typeof result?.disposition === 'string' ? result.disposition : undefined
+
+    // pi >= 1.x: trust the explicit disposition.
+    if (disposition !== undefined) return disposition === 'handled' ? 'handled' : 'normal'
+
+    // pi 0.x: no disposition. Fall back to recognizing known extension commands.
+    return this.isKnownExtensionCommand(message) ? 'handled' : 'normal'
+  }
+
+  private isKnownExtensionCommand(message: string): boolean {
+    if (!message.startsWith('/')) return false
+
+    const trimmed = message.trimStart()
+    const space = trimmed.search(/\s/)
+    const name = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
+    return this.knownExtensionCommands.has(name)
+  }
+
+  private armHandledTurnWatcher(): void {
+    this.handledTurnActive = true
+    this.scheduleHandledIdle()
+  }
+
+  private scheduleHandledIdle(): void {
+    if (this.handledIdleTimer) clearTimeout(this.handledIdleTimer)
+    this.handledIdleTimer = setTimeout(() => {
+      this.handledIdleTimer = null
+      this.maybeSettleHandledTurn()
+    }, HANDLED_PROMPT_IDLE_MS)
+  }
+
+  private maybeSettleHandledTurn(): void {
+    if (!this.handledTurnActive) return
+    // An agent run started; the normal settle-based flow owns the turn now.
+    if (this.inAgentLoop) return
+    // Blocking dialogs pause settlement; they may be answered slowly by a human.
+    if (this.pendingBlockingUiRequestIds.size > 0) return
+
+    void this.settleTurn()
+  }
+
+  private cancelHandledTurnWatcher(): void {
+    this.handledTurnActive = false
+    if (this.handledIdleTimer) {
+      clearTimeout(this.handledIdleTimer)
+      this.handledIdleTimer = null
+    }
+  }
+
+  /**
+   * If pi exits while a handled-turn watcher is pending, the prompt RPC has already
+   * resolved, so nothing else would settle the ACP request. Resolve it explicitly.
+   */
+  private handlePiExit(): void {
+    if (!this.handledTurnActive) return
+    this.cancelHandledTurnWatcher()
+
+    void this.flushEmits().finally(() => {
+      this.pendingTurn?.resolve(this.cancelRequested ? 'cancelled' : 'end_turn')
+      this.pendingTurn = null
+      this.inAgentLoop = false
     })
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
+
+    // Any pi output means the turn is not quiescent yet.
+    if (this.handledTurnActive) this.scheduleHandledIdle()
 
     switch (type) {
       case 'session_info_changed': {
@@ -897,14 +1021,25 @@ export class PiAcpSession {
       }
 
       case 'extension_ui_request': {
-        void this.handleExtensionUiRequest(ev).catch(() => {
-          const id = stringProp(ev, 'id')
-          if (!id) {
-            return
-          }
+        const id = stringProp(ev, 'id')
+        const method = stringProp(ev, 'method')
+        const isBlocking = method !== null && BLOCKING_EXTENSION_UI_METHODS.has(method)
+        if (isBlocking && id) this.pendingBlockingUiRequestIds.add(id)
 
-          void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
-        })
+        void this.handleExtensionUiRequest(ev)
+          .catch(() => {
+            if (!id) {
+              return
+            }
+
+            void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
+          })
+          .finally(() => {
+            if (!isBlocking || !id) return
+            this.pendingBlockingUiRequestIds.delete(id)
+            // A blocking dialog pauses settlement; resume the idle countdown once answered.
+            if (this.handledTurnActive) this.scheduleHandledIdle()
+          })
         break
       }
 
@@ -947,6 +1082,8 @@ export class PiAcpSession {
       }
 
       case 'agent_start': {
+        // A real agent run started; the settle-based flow owns this turn now.
+        this.cancelHandledTurnWatcher()
         this.inAgentLoop = true
         break
       }

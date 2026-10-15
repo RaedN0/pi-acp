@@ -70,6 +70,20 @@ type PiExtensionUiResponse =
 
 export type PiRpcEvent = Record<string, unknown>
 
+/**
+ * `data` of a successful `prompt` response.
+ *
+ * pi >= 1.x reports how the submission was handled:
+ *  - `handled`: an extension command or input handler consumed the prompt; no agent run
+ *    was started (so no `agent_settled` will follow).
+ *  - `queued` / `started`: a normal agent run is (about to be) in flight.
+ * pi 0.x has no `disposition` at all.
+ */
+export type PiPromptResult = {
+  disposition?: unknown
+  [key: string]: unknown
+}
+
 /** Maximum wait for an auxiliary context-usage update. */
 export const SESSION_STATS_TIMEOUT_MS = 1_000
 
@@ -109,6 +123,7 @@ export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
+  private exitHandlers: Array<() => void> = []
   private readonly preludeLines: string[] = []
 
   private constructor(child: ChildProcessWithoutNullStreams) {
@@ -143,11 +158,13 @@ export class PiRpcProcess {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.exitHandlers) h()
     })
 
     child.on('error', err => {
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.exitHandlers) h()
     })
   }
 
@@ -238,6 +255,17 @@ export class PiRpcProcess {
     }
   }
 
+  /**
+   * Register a callback invoked once the child process exits or errors out.
+   * Used to settle turns that no longer have a pending RPC to reject.
+   */
+  onExit(handler: () => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
+    }
+  }
+
   dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
     if (this.child.killed) return
     try {
@@ -256,9 +284,10 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
+  async prompt(message: string, images: unknown[] = []): Promise<PiPromptResult> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? {}) as PiPromptResult
   }
 
   async abort(): Promise<void> {

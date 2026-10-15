@@ -42,8 +42,8 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage, promptToSessionTitle } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
-import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
+import { getAgentDir, getEnableSkillCommands, getIncludeExtensionCommands, getQuietStartup } from './pi-settings.js'
+import { extensionCommandNames, toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
@@ -102,8 +102,11 @@ function builtinAvailableCommands(): AvailableCommand[] {
   ]
 }
 
-function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
-  // Preserve order, de-dupe by name (first wins).
+/**
+ * Merge command lists, preserving order and de-duping by name (first wins).
+ * Callers pass built-ins first so they always win name collisions.
+ */
+export function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
   const out: AvailableCommand[] = []
   const seen = new Set<string>()
 
@@ -280,6 +283,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const includeExtensionCommands = getIncludeExtensionCommands(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -410,16 +414,19 @@ export class PiAcpAgent implements ACPAgent {
 
         try {
           const pi = (await session.proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands, raw } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands
           })
+
+          // Cache extension command names so legacy pi (< 1.x) prompts can be classified.
+          session.setKnownExtensionCommands(extensionCommandNames(raw))
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
+              availableCommands: mergeCommands(builtinAvailableCommands(), commands)
             }
           })
           return
@@ -431,7 +438,7 @@ export class PiAcpAgent implements ACPAgent {
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands: mergeCommands(builtinAvailableCommands(), toAvailableCommands(fileCommands))
           }
         })
       })()
@@ -947,6 +954,7 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const includeExtensionCommands = getIncludeExtensionCommands(params.cwd)
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
@@ -1088,16 +1096,18 @@ export class PiAcpAgent implements ACPAgent {
 
         try {
           const pi = (await proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands, raw } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands
           })
+
+          session.setKnownExtensionCommands(extensionCommandNames(raw))
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
+              availableCommands: mergeCommands(builtinAvailableCommands(), commands)
             }
           })
           return
@@ -1109,7 +1119,7 @@ export class PiAcpAgent implements ACPAgent {
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands: mergeCommands(builtinAvailableCommands(), toAvailableCommands(fileCommands))
           }
         })
       })()

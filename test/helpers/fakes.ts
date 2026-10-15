@@ -1,5 +1,5 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
-import type { PiRpcEvent, PiSessionStats } from '../../src/pi-rpc/process.js'
+import type { PiPromptResult, PiRpcEvent, PiSessionStats } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -35,6 +35,7 @@ export class FakeAgentSideConnection {
 
 export class FakePiRpcProcess {
   private handlers: Array<(ev: PiRpcEvent) => void> = []
+  private exitHandlers: Array<() => void> = []
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
@@ -46,6 +47,9 @@ export class FakePiRpcProcess {
   /** When set, `getSessionStats()` rejects with this error. */
   sessionStatsError: unknown = null
 
+  /** `data` returned by the `prompt` RPC (e.g. `{ disposition: 'handled' }`). */
+  promptResult: PiPromptResult = {}
+
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
     return () => {
@@ -53,12 +57,25 @@ export class FakePiRpcProcess {
     }
   }
 
+  onExit(handler: () => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
+    }
+  }
+
   emit(ev: PiRpcEvent) {
     for (const h of this.handlers) h(ev)
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  /** Simulate the child process exiting (used to assert we don't hang). */
+  exit() {
+    for (const h of this.exitHandlers) h()
+  }
+
+  async prompt(message: string, attachments: unknown[] = []): Promise<PiPromptResult> {
     this.prompts.push({ message, attachments })
+    return this.promptResult
   }
 
   async abort(): Promise<void> {
