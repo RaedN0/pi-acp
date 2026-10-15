@@ -135,6 +135,10 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
 
+  // Whether the connected client negotiated form elicitation. Captured at
+  // `initialize` and propagated to every session created afterwards.
+  private formElicitation = false
+
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
     void _config
@@ -218,7 +222,8 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        formElicitation: this.formElicitation
       })
 
       this.lastSessionCwd = cwd
@@ -243,6 +248,11 @@ export class PiAcpAgent implements ACPAgent {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
+
+    // Clients advertise elicitation support here (e.g. Zed sends `form` + `url`).
+    // Extension dialogs prefer inline forms when available because ACP
+    // permission options cannot carry freeform text.
+    this.formElicitation = params.clientCapabilities?.elicitation?.form != null
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -291,7 +301,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      formElicitation: this.formElicitation
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.

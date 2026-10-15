@@ -1,6 +1,9 @@
 import type {
   AgentSideConnection,
   ContentBlock,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  ElicitationPropertySchema,
   McpServer,
   PermissionOption,
   SessionUpdate,
@@ -41,6 +44,12 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /**
+   * Whether the connected client negotiated `clientCapabilities.elicitation.form`.
+   * When true, extension dialogs are surfaced as inline ACP forms instead of
+   * permission prompts (which cannot carry freeform text).
+   */
+  formElicitation?: boolean
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -67,6 +76,58 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+const CONFIRM_ELICITATION_FIELD = 'confirmed'
+
+/**
+ * Canonical hint the `ask_user_question` extension passes as the `input`
+ * placeholder for multi-select questions. Recognising it lets us render real
+ * checkboxes instead of a free-text box that makes the user type "1,3".
+ */
+const MULTI_SELECT_PLACEHOLDER = '1,3; custom answer'
+
+/**
+ * Split a questionnaire `input` dialog into its prose lead-in and its numbered
+ * option list.
+ *
+ * The `ask_user_question` RPC fallback folds the option list into the dialog
+ * title because `ui.input` only carries a single string. Recovering the options
+ * lets us render real checkboxes instead of asking the user to type indices.
+ */
+function parseOptionQuestion(text: string | null): { preamble: string; options: string[] } {
+  if (!text) return { preamble: '', options: [] }
+
+  const lines = text.split('\n')
+  const options: string[] = []
+  let firstOptionLine = -1
+
+  for (const [index, rawLine] of lines.entries()) {
+    const match = /^\s*(\d+)\.\s+(.*\S)\s*$/.exec(rawLine)
+    if (!match || Number(match[1]) !== options.length + 1) continue
+    if (firstOptionLine === -1) firstOptionLine = index
+    options.push(match[2])
+  }
+
+  if (options.length === 0) return { preamble: text.trim(), options: [] }
+
+  const preamble = lines
+    .slice(0, firstOptionLine)
+    .join('\n')
+    .trim()
+  return { preamble, options }
+}
+
+/**
+ * Split a `"<label> — <description>"` option line, as produced by the
+ * questionnaire's RPC fallback, so clients can render the two separately.
+ * Falls back to a single title when there is no separator.
+ */
+function splitOptionLine(line: string): { title: string; description?: string } {
+  const separator = line.indexOf(' — ')
+  if (separator <= 0) return { title: line }
+  const title = line.slice(0, separator).trim()
+  const description = line.slice(separator + 3).trim()
+  return description.length > 0 ? { title, description } : { title }
+}
 
 /**
  * How long a `handled` prompt (extension command / input handler consumed it, so no
@@ -254,7 +315,8 @@ export class SessionManager {
       proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      autoTitle: true
+      autoTitle: true,
+      formElicitation: params.formElicitation ?? false
     })
 
     this.sessions.set(sessionId, session)
@@ -282,7 +344,8 @@ export class SessionManager {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      autoTitle: false
+      autoTitle: false,
+      formElicitation: params.formElicitation ?? false
     })
 
     this.sessions.set(sessionId, session)
@@ -290,10 +353,18 @@ export class SessionManager {
   }
 }
 
+type ElicitOutcome =
+  | { status: 'accepted'; content: Record<string, unknown> }
+  | { status: 'declined' }
+  | { status: 'unsupported' }
+
 export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
   readonly mcpServers: McpServer[]
+
+  /** Whether the client accepts inline form elicitations. */
+  private readonly formElicitation: boolean
 
   private startupInfo: string | null = null
   private startupInfoSent = false
@@ -351,6 +422,7 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     autoTitle?: boolean
+    formElicitation?: boolean
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -358,6 +430,7 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.formElicitation = opts.formElicitation ?? false
     this.initialTitlePending = opts.autoTitle ?? false
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
@@ -1147,6 +1220,41 @@ export class PiAcpSession {
   }
 
   /**
+   * Surface a pi extension dialog as an inline ACP form.
+   *
+   * `message` is rendered once at the top of the card and `requestedSchema.title`
+   * as the form header, so we only send the message and leave the schema title
+   * unset to avoid the same text appearing twice.
+   */
+  private async elicitForm(
+    message: string,
+    properties: Record<string, ElicitationPropertySchema>,
+    required: string[]
+  ): Promise<ElicitOutcome> {
+    const request: CreateElicitationRequest = {
+      sessionId: this.sessionId,
+      message,
+      mode: 'form',
+      requestedSchema: { type: 'object', properties, required }
+    }
+
+    let response: CreateElicitationResponse
+    try {
+      response = await this.conn.unstable_createElicitation(request)
+    } catch {
+      // Client rejected the request (typically: no elicitation capability).
+      return { status: 'unsupported' }
+    }
+
+    if (response?.action !== 'accept') return { status: 'declined' }
+    const content = response.content
+    return {
+      status: 'accepted',
+      content: content !== null && typeof content === 'object' ? content : {}
+    }
+  }
+
+  /**
    * Pi `input`/`editor` UI requests carry freeform text (ask_user custom answers,
    * comments, multi-select). ACP permission options cannot carry text, so surface
    * them via the (UNSTABLE) `elicitation/create` form mechanism. Clients that do
@@ -1157,31 +1265,103 @@ export class PiAcpSession {
     const title = stringProp(ev, 'title') ?? 'Pi input'
     const placeholder = stringProp(ev, 'placeholder')
     const prefill = stringProp(ev, 'prefill')
-    try {
-      const result = await this.conn.unstable_createElicitation({
-        sessionId: this.sessionId,
-        message: title,
-        mode: 'form',
-        requestedSchema: {
-          type: 'object',
-          title,
-          properties: {
-            value: {
-              type: 'string',
-              title: placeholder ?? 'Answer',
-              ...(prefill ? { default: prefill } : {})
-            }
-          },
-          required: ['value']
-        }
-      })
-      const value = result?.action === 'accept' ? result.content?.value : undefined
-      await this.proc.sendExtensionUiResponse(
-        typeof value === 'string' ? { id, value } : { id, cancelled: true }
-      )
-    } catch {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+
+    // The questionnaire's multi-select fallback folds its options into the title
+    // and asks for "1,3; custom answer" as free text. When we can recognise that
+    // shape, offer real checkboxes instead of making the user type indices.
+    if (this.formElicitation && placeholder === MULTI_SELECT_PLACEHOLDER) {
+      const { preamble, options } = parseOptionQuestion(title)
+      if (options.length > 0) {
+        await this.handleMultiSelectInput(ev, id, preamble, options)
+        return
+      }
     }
+
+    if (!this.formElicitation) {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    const outcome = await this.elicitForm(
+      title,
+      {
+        value: {
+          type: 'string',
+          // Field label; without it the client falls back to the raw key ("value").
+          title: placeholder ?? 'Answer',
+          ...(prefill !== null ? { default: prefill } : {})
+        }
+      },
+      ['value']
+    )
+
+    if (outcome.status !== 'accepted') {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    const value = outcome.content['value']
+    await this.proc.sendExtensionUiResponse(
+      typeof value === 'string' ? { id, value } : { id, cancelled: true }
+    )
+  }
+
+  /**
+   * Render a multi-select question as real checkboxes, keeping a freeform field
+   * so the user can still supply a custom answer. Mirrors the `"1,3; custom"`
+   * grammar the questionnaire parses from a single `input` string.
+   */
+  private async handleMultiSelectInput(
+    ev: PiRpcEvent,
+    id: string,
+    message: string,
+    options: string[]
+  ): Promise<void> {
+    const outcome = await this.elicitForm(
+      message,
+      {
+        selection: {
+          type: 'array',
+          title: 'Select all that apply',
+          items: {
+            anyOf: options.map((option, index) => ({
+              const: `${CHOICE_OPTION_PREFIX}${index}`,
+              ...splitOptionLine(option)
+            }))
+          }
+        },
+        custom: {
+          type: 'string',
+          title: 'Custom answer',
+          description: 'Optional. Appended to the selection above.'
+        }
+      },
+      ['selection']
+    )
+
+    if (outcome.status !== 'accepted') {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    const selected = Array.isArray(outcome.content['selection'])
+      ? (outcome.content['selection'] as unknown[]).filter(
+          (value): value is string => typeof value === 'string'
+        )
+      : []
+    const indices = selected
+      .map(value => optionIndex(value))
+      .filter((index): index is number => index !== null)
+      .sort((a, b) => a - b)
+
+    const customRaw = outcome.content['custom']
+    const custom = typeof customRaw === 'string' ? customRaw.trim() : ''
+
+    // `ui.input` expects a single string; the questionnaire parses this exact
+    // grammar (`"1,3; custom"`), keeping both the selection and the custom text.
+    const selection = indices.map(index => index + 1).join(',')
+    const answer = custom.length > 0 ? (selection.length > 0 ? `${selection}; ${custom}` : custom) : selection
+    await this.proc.sendExtensionUiResponse({ id, value: answer })
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
@@ -1190,6 +1370,40 @@ export class PiAcpSession {
     if (!options.length) {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
+    }
+
+    if (this.formElicitation) {
+      const title = stringProp(ev, 'title') ?? 'Pi select'
+      const outcome = await this.elicitForm(
+        title,
+        {
+          choice: {
+            type: 'string',
+            title: 'Choose one',
+            oneOf: options.map((option, index) => ({
+              const: `${CHOICE_OPTION_PREFIX}${index}`,
+              title: option
+            }))
+          }
+        },
+        ['choice']
+      )
+
+      if (outcome.status === 'accepted') {
+        const value = outcome.content['choice']
+        const index = typeof value === 'string' ? optionIndex(value) : null
+        const chosen = index === null ? null : (options.at(index) ?? null)
+        await this.proc.sendExtensionUiResponse(
+          chosen === null ? { id, cancelled: true } : { id, value: chosen }
+        )
+        return
+      }
+
+      if (outcome.status === 'declined') {
+        await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+        return
+      }
+      // Unsupported: fall through to the permission bridge below.
     }
 
     const permissionOptions: PermissionOption[] = options.map((name, index) => ({
@@ -1210,6 +1424,37 @@ export class PiAcpSession {
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
+    if (this.formElicitation) {
+      const title = stringProp(ev, 'title') ?? 'Confirm'
+      const message = stringProp(ev, 'message')
+
+      // The card renders `message` at the top and the field renders its own
+      // title/description, so keep the clarifying text in exactly one place.
+      const outcome = await this.elicitForm(
+        title,
+        {
+          [CONFIRM_ELICITATION_FIELD]: {
+            type: 'boolean',
+            title: 'Confirm',
+            ...(message !== null && message.length > 0 ? { description: message } : {})
+          }
+        },
+        [CONFIRM_ELICITATION_FIELD]
+      )
+
+      if (outcome.status === 'accepted') {
+        const confirmed = outcome.content[CONFIRM_ELICITATION_FIELD] === true
+        await this.proc.sendExtensionUiResponse({ id, confirmed })
+        return
+      }
+
+      if (outcome.status === 'declined') {
+        await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+        return
+      }
+      // Unsupported: fall through to the permission bridge below.
+    }
+
     const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
     if (selected === null) {
       return

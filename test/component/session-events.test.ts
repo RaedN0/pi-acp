@@ -251,7 +251,8 @@ test('PiAcpSession: routes input and editor extension UI requests through elicit
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    formElicitation: true
   })
 
   proc.emit({ type: 'extension_ui_request', id: 'ui-3', method: 'input', title: 'Enter name' })

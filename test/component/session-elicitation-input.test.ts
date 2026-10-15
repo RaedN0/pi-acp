@@ -3,14 +3,19 @@ import assert from 'node:assert/strict'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
-function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): void {
+function makeSession(
+  conn: FakeAgentSideConnection,
+  proc: FakePiRpcProcess,
+  formElicitation = true
+): void {
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    formElicitation
   })
 }
 
